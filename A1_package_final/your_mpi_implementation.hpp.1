@@ -1,0 +1,162 @@
+//     [NAME]:Shi Zhengyang            [STUDENT ID]: 21073402
+//     [EMAIL]:zshiap@connect.ust.hk 
+
+// *********************************************************************
+//     NOTICE: Write your code only in this file and only submit this 
+//     file to Canvas. You can add more functions, structures, classes,
+//     and include other C++ standard libraries in this file if needed.
+//     Do NOT change the signature of the function gen_um_lists_MPI, 
+//     which will be called by the main function.
+// *********************************************************************
+#pragma once
+
+#include <string>
+#include <vector>
+#include "utilities.hpp"
+#include "mpi.h"
+
+using namespace std;
+
+/// @brief Generate universal minimizer lists for each read in parallel using MPI.
+/// @param comm The MPI communicator.
+/// @param my_rank Global rank of this process.
+/// @param num_process Total number of processes.
+/// @param k length of k-mer (only available in Process 0 when calling).
+/// @param n number of reads (only available in Process 0 when calling).
+/// @param reads The input reads in vector of strings (only available in Process 0 when calling).
+/// @param reads_CSR The input reads in CSR format (only available in Process 0 when calling).
+/// @param reads_CSR_offs The offsets of the input reads in CSR format (only available in Process 0 when calling).
+/// @param um_lists The output lists of universal minimizers (result should be gathered to this vector in Process 0 when function ends).
+void gen_um_lists_MPI (MPI_Comm comm, int my_rank, int num_process, int k, int n, vector<string>& reads, char* reads_CSR, int* reads_CSR_offs, vector<vector<kmer_t>>& um_lists) {
+    // Broadcast k and n to all processes
+    MPI_Bcast(&k, 1, MPI_INT, 0, comm);
+    MPI_Bcast(&n, 1, MPI_INT, 0, comm);
+    
+    // Sequential processing for n ≤ num_process
+    if (n <= num_process) {
+        if (my_rank == 0) {
+            // Process 0 handles all the reads
+            um_lists.resize(n);
+            for (int i = 0; i < n; i++) {
+                um_lists[i] = generate_universal_minimizer_list(k, reads[i]);
+                if (um_lists[i].empty()) {
+                    um_lists[i].push_back(-1);
+                }
+            }
+        }
+        return;
+    }
+    
+    // For larger datasets, distribute the workload
+    int reads_per_process = n / num_process;
+    int remainder = n % num_process;
+    
+    int my_start = 0;
+    int my_count = 0;
+    
+    if (my_rank < remainder) {
+        my_count = reads_per_process + 1;
+        my_start = my_rank * my_count;
+    } else {
+        my_count = reads_per_process;
+        my_start = remainder * (reads_per_process + 1) + (my_rank - remainder) * my_count;
+    }
+    
+    vector<string> my_reads(my_count);
+    
+    if (my_rank == 0) {
+        // Process 0 keeps its own reads
+        for (int i = 0; i < my_count; i++) {
+            my_reads[i] = reads[my_start + i];
+        }
+        
+        // Send reads to other processes
+        for (int proc = 1; proc < num_process; proc++) {
+            int proc_start, proc_count;
+            
+            if (proc < remainder) {
+                proc_count = reads_per_process + 1;
+                proc_start = proc * proc_count;
+            } else {
+                proc_count = reads_per_process;
+                proc_start = remainder * (reads_per_process + 1) + (proc - remainder) * proc_count;
+            }
+            
+            for (int i = 0; i < proc_count; i++) {
+                int read_len = reads[proc_start + i].length();
+                MPI_Send(&read_len, 1, MPI_INT, proc, 0, comm);
+                MPI_Send(reads[proc_start + i].c_str(), read_len, MPI_CHAR, proc, 1, comm);
+            }
+        }
+    } else {
+        // Other processes receive their reads
+        for (int i = 0; i < my_count; i++) {
+            int read_len;
+            MPI_Recv(&read_len, 1, MPI_INT, 0, 0, comm, MPI_STATUS_IGNORE);
+            
+            char* buffer = new char[read_len + 1];
+            buffer[read_len] = '\0';
+            
+            MPI_Recv(buffer, read_len, MPI_CHAR, 0, 1, comm, MPI_STATUS_IGNORE);
+            my_reads[i] = string(buffer);
+            
+            delete[] buffer;
+        }
+    }
+    
+    // Process my reads to find universal minimizers
+    vector<vector<kmer_t>> my_um_lists(my_count);
+    for (int i = 0; i < my_count; i++) {
+        my_um_lists[i] = generate_universal_minimizer_list(k, my_reads[i]);
+        
+        if (my_um_lists[i].empty()) {
+            my_um_lists[i].push_back(-1);
+        }
+    }
+    
+    // Gather results
+    if (my_rank == 0) {
+        // Initialize result vector
+        um_lists.resize(n);
+        
+        // Add process 0's results
+        for (int i = 0; i < my_count; i++) {
+            um_lists[my_start + i] = my_um_lists[i];
+        }
+        
+        // Receive results from other processes
+        for (int proc = 1; proc < num_process; proc++) {
+            int proc_start, proc_count;
+            
+            if (proc < remainder) {
+                proc_count = reads_per_process + 1;
+                proc_start = proc * proc_count;
+            } else {
+                proc_count = reads_per_process;
+                proc_start = remainder * (reads_per_process + 1) + (proc - remainder) * proc_count;
+            }
+            
+            for (int i = 0; i < proc_count; i++) {
+                int list_size;
+                MPI_Recv(&list_size, 1, MPI_INT, proc, 2, comm, MPI_STATUS_IGNORE);
+                
+                vector<kmer_t> list(list_size);
+                if (list_size > 0) {
+                    MPI_Recv(list.data(), list_size, MPI_UNSIGNED, proc, 3, comm, MPI_STATUS_IGNORE);
+                }
+                
+                um_lists[proc_start + i] = list;
+            }
+        }
+    } else {
+        // Send my results to process 0
+        for (int i = 0; i < my_count; i++) {
+            int list_size = my_um_lists[i].size();
+            MPI_Send(&list_size, 1, MPI_INT, 0, 2, comm);
+            
+            if (list_size > 0) {
+                MPI_Send(my_um_lists[i].data(), list_size, MPI_UNSIGNED, 0, 3, comm);
+            }
+        }
+    }
+}
